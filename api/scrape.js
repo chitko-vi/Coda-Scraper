@@ -35,12 +35,13 @@ export default async function handler(req, res) {
 
     const afterLabel = html.substring(startIdx + category.length);
 
-    // ── Step 2: Cut at next REAL section header ───────────────────────────
-    // Rules:
-    // - If gap between </a> and next <a> contains a <button> → it's a UI
-    //   control (View All / View Less) → SKIP and keep collecting tiles
-    // - If gap text matches known UI button labels → SKIP
-    // - If gap is short text with letters and no special chars → real header → STOP
+    // ── Step 2: Cut section at the right boundary ─────────────────────────
+    // All tiles (visible + hidden) live inside one grid-container div.
+    // The <button> (View All/Less) appears AFTER the grid, outside it.
+    // So hitting a <button> in the gap means we have ALL tiles → stop.
+    // Real category headers are plain text between </a> and <a> → stop.
+    // Known UI text labels → stop.
+
     const UI_TEXTS = [
       "view all", "view less", "see all", "see less", "see more",
       "show all", "show less", "load more", "expand",
@@ -55,6 +56,7 @@ export default async function handler(req, res) {
     while (searchPos < afterLabel.length) {
       const closeTag = afterLabel.indexOf("</a>", searchPos);
       if (closeTag === -1) break;
+
       const afterClose = closeTag + 4;
       const nextOpen = afterLabel.indexOf("<a ", afterClose);
       if (nextOpen === -1) break;
@@ -67,23 +69,21 @@ export default async function handler(req, res) {
         const gapLower = gap.toLowerCase();
         const gapText = gap.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
 
-        // ── KEY FIX: skip if gap contains a <button> tag ──────────────────
-        // Codashop's View All / View Less is always a <button>, never an <a>
-        // Hidden tiles come right after this button in the HTML
+        // <button> in gap = View All/Less button after the grid → all tiles
+        // already collected, stop here
         if (gapLower.includes("<button")) {
-  cutAt = afterClose;   
-  break;
-}
+          cutAt = afterClose;
+          break;
         }
 
-        // Skip known UI button label texts
+        // Known UI button text → stop
         const isUIText = UI_TEXTS.some(t => gapText.toLowerCase().includes(t));
         if (isUIText) {
-          searchPos = nextOpen + 1;
-          continue;
+          cutAt = afterClose;
+          break;
         }
 
-        // Real category header → stop collecting
+        // Short text with letters = real category header → stop
         const looksLikeHeader =
           gapText.length >= 2 &&
           gapText.length <= 120 &&
@@ -114,10 +114,15 @@ export default async function handler(req, res) {
       const path = hrefMatch[1];
       if (path === "/" || path.split("/").length < 3) continue;
 
-      // Title: alt → <p> text → stripped text
+      // Title: alt → product-name div → <p> text → stripped text
       let title = "";
       const altMatch = chunk.match(/alt="([^"<>]+)"/);
       if (altMatch) title = altMatch[1].trim();
+
+      if (!title) {
+        const divMatch = chunk.match(/class="product-name"[^>]*>([\s\S]*?)<\/div>/);
+        if (divMatch) title = divMatch[1].replace(/<[^>]+>/g, "").trim();
+      }
 
       if (!title) {
         const pMatch = chunk.match(/<p[^>]*>([\s\S]*?)<\/p>/);
