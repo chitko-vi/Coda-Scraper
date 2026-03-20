@@ -1,5 +1,5 @@
 {
-  "name": "codashop-scraper",
+  "name": "coda-scraper",
   "version": "1.0.0",
   "scripts": {
     "dev": "vite",
