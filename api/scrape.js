@@ -1,137 +1,163 @@
-// api/scrape.js
-// Two modes:
-//   ?url=...&category=VOUCHERS   → single category (original behaviour)
-//   ?url=...&all=true            → all categories with position tracking
-
 export default async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET");
 
-  const { url, category, all } = req.query;
+  const { url, category } = req.query;
+  if (!url || !category) {
+    return res.status(400).json({ error: "Missing url or category parameter" });
+  }
 
-  if (!url) return res.status(400).json({ error: "Missing url parameter" });
-  if (!all && !category) return res.status(400).json({ error: "Provide category=NAME or all=true" });
-
-  // ── Fetch page HTML ───────────────────────────────────────────────────────
-  let html;
   try {
     const response = await fetch(url, {
       headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
       },
     });
-    if (!response.ok) return res.status(502).json({ error: `Failed to fetch page: ${response.status}` });
-    html = await response.text();
-  } catch (err) {
-    return res.status(500).json({ error: `Fetch failed: ${err.message}` });
-  }
 
-  const sections = splitIntoSections(html);
-  if (sections.length === 0) {
-    return res.status(404).json({ error: "No product-list sections found. Page structure may have changed." });
-  }
+    if (!response.ok) {
+      return res.status(502).json({ error: `Failed to fetch page: ${response.status}` });
+    }
 
-  // ── Mode: all categories ──────────────────────────────────────────────────
-  if (all === "true") {
-    const results = [];
-    for (const section of sections) {
-      const categoryName = extractTitle(section);
-      if (!categoryName) continue;
-      const tiles = extractTiles(section);
-      tiles.forEach((tile, index) => {
-        results.push({ category: categoryName, position: index + 1, ...tile });
+    const html = await response.text();
+
+    // ── Step 1: Find category label ───────────────────────────────────────
+    const escaped = category.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const startIdx = html.search(new RegExp(">\\s*" + escaped + "\\s*<", "i"));
+
+    if (startIdx === -1) {
+      return res.status(404).json({
+        error: `Category "${category}" not found`,
+        hint: "Check the category name matches exactly as shown on the page",
       });
     }
-    if (results.length === 0) return res.status(404).json({ error: "No tiles found on this page." });
+
+    const afterLabel = html.substring(startIdx + category.length);
+
+    // ── Step 2: Cut at next REAL section header ───────────────────────────
+    // Rules:
+    // - If gap between </a> and next <a> contains a <button> → it's a UI
+    //   control (View All / View Less) → SKIP and keep collecting tiles
+    // - If gap text matches known UI button labels → SKIP
+    // - If gap is short text with letters and no special chars → real header → STOP
+    const UI_TEXTS = [
+      "view all", "view less", "see all", "see less", "see more",
+      "show all", "show less", "load more", "expand",
+      "查看全部", "收起", "ver todo", "tout voir",
+      "すべて見る", "전체보기", "lihat semua", "xem tất cả",
+    ];
+
+    let cutAt = afterLabel.length;
+    let productsSeen = 0;
+    let searchPos = 0;
+
+    while (searchPos < afterLabel.length) {
+      const closeTag = afterLabel.indexOf("</a>", searchPos);
+      if (closeTag === -1) break;
+      const afterClose = closeTag + 4;
+      const nextOpen = afterLabel.indexOf("<a ", afterClose);
+      if (nextOpen === -1) break;
+
+      const preceding = afterLabel.substring(Math.max(0, closeTag - 600), closeTag);
+      if (/href="\/[^"]{5,}"/.test(preceding)) productsSeen++;
+
+      if (productsSeen >= 1) {
+        const gap = afterLabel.substring(afterClose, nextOpen);
+        const gapLower = gap.toLowerCase();
+        const gapText = gap.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+
+        // ── KEY FIX: skip if gap contains a <button> tag ──────────────────
+        // Codashop's View All / View Less is always a <button>, never an <a>
+        // Hidden tiles come right after this button in the HTML
+        if (gapLower.includes("<button")) {
+          searchPos = nextOpen + 1;
+          continue;
+        }
+
+        // Skip known UI button label texts
+        const isUIText = UI_TEXTS.some(t => gapText.toLowerCase().includes(t));
+        if (isUIText) {
+          searchPos = nextOpen + 1;
+          continue;
+        }
+
+        // Real category header → stop collecting
+        const looksLikeHeader =
+          gapText.length >= 2 &&
+          gapText.length <= 120 &&
+          /\p{L}/u.test(gapText) &&
+          !gapText.includes("http") &&
+          !gapText.includes("/") &&
+          !gapText.includes("{");
+
+        if (looksLikeHeader) {
+          cutAt = afterClose;
+          break;
+        }
+      }
+
+      searchPos = nextOpen + 1;
+    }
+
+    const section = afterLabel.substring(0, cutAt);
+
+    // ── Step 3: Extract all product tiles from section ────────────────────
+    const chunks = section.split(/<\/a>/);
+    const results = [];
+    const seen = new Set();
+
+    for (const chunk of chunks) {
+      const hrefMatch = chunk.match(/href="(\/[^"#?]+)"/);
+      if (!hrefMatch) continue;
+      const path = hrefMatch[1];
+      if (path === "/" || path.split("/").length < 3) continue;
+
+      // Title: alt → <p> text → stripped text
+      let title = "";
+      const altMatch = chunk.match(/alt="([^"<>]+)"/);
+      if (altMatch) title = altMatch[1].trim();
+
+      if (!title) {
+        const pMatch = chunk.match(/<p[^>]*>([\s\S]*?)<\/p>/);
+        if (pMatch) title = pMatch[1].replace(/<[^>]+>/g, "").trim();
+      }
+
+      if (!title) {
+        const stripped = chunk.replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim();
+        const parts = stripped.split("  ").filter(s => s.trim().length > 1);
+        if (parts.length) title = parts[parts.length - 1].trim();
+      }
+
+      if (!title || title.includes("<")) continue;
+
+      // Image: src → srcset first item → data-src
+      let image = "";
+      const srcMatch = chunk.match(/\bsrc="(https?:\/\/[^"]+)"/);
+      if (srcMatch) {
+        image = srcMatch[1];
+      } else {
+        const srcsetMatch = chunk.match(/srcset="([^"]+)"/);
+        if (srcsetMatch) image = srcsetMatch[1].split(",")[0].trim().split(" ")[0];
+      }
+      if (!image) {
+        const dataSrcMatch = chunk.match(/data-src="([^"]+)"/);
+        if (dataSrcMatch) image = dataSrcMatch[1];
+      }
+      if (image && !image.startsWith("http")) {
+        image = "https://cdn1.codashop.com" + image;
+      }
+
+      const fullUrl = "https://www.codashop.com" + path;
+      if (!seen.has(fullUrl)) {
+        seen.add(fullUrl);
+        results.push({ title, url: fullUrl, image });
+      }
+    }
+
     return res.status(200).json(results);
+
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
   }
-
-  // ── Mode: single category ─────────────────────────────────────────────────
-  const categoryTarget = category.trim().toUpperCase();
-  const availableTitles = [];
-  let matchedSection = null;
-
-  for (const section of sections) {
-    const title = extractTitle(section);
-    if (title) availableTitles.push(title);
-    if (title && title.toUpperCase() === categoryTarget) matchedSection = section;
-  }
-
-  if (!matchedSection) {
-    return res.status(404).json({ error: `Category "${category}" not found.`, found: availableTitles });
-  }
-
-  const products = extractTiles(matchedSection);
-  if (products.length === 0) {
-    return res.status(404).json({ error: `"${category}" found but contained no product tiles.`, found: availableTitles });
-  }
-
-  return res.status(200).json(products);
-}
-
-// ── Split full HTML into one chunk per .product-list ─────────────────────────
-function splitIntoSections(html) {
-  const regex = /<div[^>]*class="[^"]*product-list[^"]*"[^>]*>/g;
-  const positions = [];
-  let m;
-  while ((m = regex.exec(html)) !== null) {
-    if (/class="[^"]*product-list__/.test(m[0])) continue; // skip sub-elements
-    positions.push(m.index);
-  }
-  if (positions.length === 0) return [];
-  return positions.map((start, i) => html.substring(start, positions[i + 1] || html.length));
-}
-
-// ── Extract title from .product-list__title ───────────────────────────────────
-function extractTitle(sectionHtml) {
-  const match = sectionHtml.match(/class="[^"]*product-list__title[^"]*"[^>]*>([\s\S]*?)<\/div>/);
-  if (!match) return null;
-  return match[1].replace(/<[^>]+>/g, "").trim();
-}
-
-// ── Extract all a.product-tile elements from a section ────────────────────────
-function extractTiles(sectionHtml) {
-  const chunks  = sectionHtml.split(/<\/a>/i);
-  const results = [];
-  const seen    = new Set();
-
-  for (const chunk of chunks) {
-    if (!chunk.includes("product-tile")) continue;
-
-    const hrefMatch = chunk.match(/href="(\/[^"#?]+)"/);
-    if (!hrefMatch) continue;
-    const path = hrefMatch[1];
-    if (path.split("/").filter(Boolean).length < 2) continue;
-
-    const fullUrl = `https://www.codashop.com${path}`;
-    if (seen.has(fullUrl)) continue;
-
-    // Image: src first, then first item of srcset
-    let image = "";
-    const srcMatch = chunk.match(/\bsrc="(https?:\/\/[^"]+)"/);
-    if (srcMatch) {
-      image = srcMatch[1];
-    } else {
-      const srcsetMatch = chunk.match(/srcset="([^"]+)"/);
-      if (srcsetMatch) image = srcsetMatch[1].split(",")[0].trim().split(" ")[0];
-    }
-    if (!image) continue;
-
-    // Title: .product-name first, then img alt
-    let title = "";
-    const nameMatch = chunk.match(/class="[^"]*product-name[^"]*"[^>]*>([\s\S]*?)<\/div>/);
-    if (nameMatch) title = nameMatch[1].replace(/<[^>]+>/g, "").replace(/&amp;/g, "&").trim();
-    if (!title) {
-      const altMatch = chunk.match(/\balt="([^"]+)"/);
-      if (altMatch) title = altMatch[1].replace(/&amp;/g, "&").trim();
-    }
-    if (!title) continue;
-
-    seen.add(fullUrl);
-    results.push({ title, url: fullUrl, image });
-  }
-
-  return results;
 }
