@@ -71,8 +71,9 @@ export default async function handler(req, res) {
         // Codashop's View All / View Less is always a <button>, never an <a>
         // Hidden tiles come right after this button in the HTML
         if (gapLower.includes("<button")) {
-          searchPos = nextOpen + 1;
-          continue;
+  cutAt = afterClose;   
+  break;
+}
         }
 
         // Skip known UI button label texts
