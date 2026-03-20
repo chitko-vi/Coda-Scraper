@@ -37,7 +37,7 @@ A production-ready web scraper for Codashop products using Playwright and Expres
 ```bash
 curl "http://localhost:3000/api/scrape?url=https://www.codashop.com/en-ph/&category=Vouchers"
 ```
-
+ 
 ## Deployment on Render
 
 1. **Create a new Web Service** on Render.
